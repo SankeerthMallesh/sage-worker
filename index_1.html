@@ -1,0 +1,15 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"><title>Sage</title><style>html,body{margin:0;background:#f6f1e4}</style></head>
+<body>
+<script>
+/* Loads your original site file (sage-base.html) and changes the free arcade plays from 5 to 6. */
+fetch('sage-base.html',{cache:'no-cache'})
+.then(function(r){if(!r.ok)throw 0;return r.text()})
+.then(function(h){
+  h=h.replace('gp:5,tp:1','gp:6,tp:1')
+     .replace("You've used your 5 free arcade plays","You've used your 6 free arcade plays");
+  document.open();document.write(h);document.close();
+})
+.catch(function(){location.replace('sage-base.html')});
+</script>
+</body></html>
