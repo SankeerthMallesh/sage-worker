@@ -8,8 +8,6 @@
 //   PRICE_COURSE, PRICE_MONTHLY, PRICE_YEARLY
 
 const STRIPE_API = 'https://api.stripe.com/v1';
-// Pinned so the request shapes below keep working when Stripe ships newer API versions.
-const STRIPE_VERSION = '2025-03-31.basil';
 
 const PLANS = {
   course: { mode: 'payment', priceVar: 'PRICE_COURSE' },
@@ -73,7 +71,6 @@ async function stripeFetch(env, method, path, params) {
     method,
     headers: {
       Authorization: 'Bearer ' + env.STRIPE_SECRET_KEY,
-      'Stripe-Version': STRIPE_VERSION,
     },
   };
   if (params && method !== 'GET') {
@@ -127,7 +124,7 @@ async function checkout(request, env) {
 
   const origin = new URL(request.url).origin;
   const p = new URLSearchParams();
-  p.set('ui_mode', 'embedded');
+  p.set('ui_mode', 'embedded_page');
   p.set('mode', plan.mode);
   p.set('line_items[0][price]', priceId);
   p.set('line_items[0][quantity]', '1');
@@ -141,7 +138,9 @@ async function checkout(request, env) {
 
   const r = await stripeFetch(env, 'POST', '/checkout/sessions', p);
   if (!r.ok || !r.data || !r.data.client_secret) {
-    return json({ error: 'Could not start checkout. Please try again.' }, 502);
+    const why = r.data && r.data.error && r.data.error.message ? r.data.error.message : 'status ' + r.status;
+    console.error('Stripe checkout error:', r.status, JSON.stringify(r.data && r.data.error));
+    return json({ error: 'Could not start checkout: ' + why }, 502);
   }
   return json({
     publishableKey: env.STRIPE_PUBLISHABLE_KEY,
