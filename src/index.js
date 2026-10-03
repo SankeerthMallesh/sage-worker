@@ -118,18 +118,27 @@ async function checkout(request, env) {
   if (!plan) return json({ error: 'Unknown plan.' }, 400);
 
   const priceId = env[plan.priceVar];
-  if (!env.STRIPE_SECRET_KEY || !env.STRIPE_PUBLISHABLE_KEY || !env.SIGNING_SECRET || !priceId) {
+  // Default: Stripe's own full-page checkout (roomy, works on every device).
+  // Set the variable CHECKOUT_MODE to "embedded" to show the form inside a popup instead.
+  const embedded = env.CHECKOUT_MODE === 'embedded';
+  if (!env.STRIPE_SECRET_KEY || !env.SIGNING_SECRET || !priceId || (embedded && !env.STRIPE_PUBLISHABLE_KEY)) {
     return json({ error: 'Payments are not configured yet.' }, 500);
   }
 
   const origin = new URL(request.url).origin;
   const p = new URLSearchParams();
-  p.set('ui_mode', 'embedded_page');
   p.set('mode', plan.mode);
   p.set('line_items[0][price]', priceId);
   p.set('line_items[0][quantity]', '1');
-  p.set('return_url', origin + '/?session_id={CHECKOUT_SESSION_ID}&paid=' + planKey);
-  p.set('redirect_on_completion', 'if_required');
+  const back = origin + '/?session_id={CHECKOUT_SESSION_ID}&paid=' + planKey;
+  if (embedded) {
+    p.set('ui_mode', 'embedded_page');
+    p.set('return_url', back);
+    p.set('redirect_on_completion', 'if_required');
+  } else {
+    p.set('success_url', back);
+    p.set('cancel_url', origin + '/');
+  }
   p.set('metadata[plan]', planKey);
   if (plan.mode === 'subscription') {
     p.set('subscription_data[trial_period_days]', String(plan.trialDays));
@@ -137,11 +146,12 @@ async function checkout(request, env) {
   }
 
   const r = await stripeFetch(env, 'POST', '/checkout/sessions', p);
-  if (!r.ok || !r.data || !r.data.client_secret) {
+  if (!r.ok || !r.data || !(embedded ? r.data.client_secret : r.data.url)) {
     const why = r.data && r.data.error && r.data.error.message ? r.data.error.message : 'status ' + r.status;
     console.error('Stripe checkout error:', r.status, JSON.stringify(r.data && r.data.error));
     return json({ error: 'Could not start checkout: ' + why }, 502);
   }
+  if (!embedded) return json({ url: r.data.url, sessionId: r.data.id });
   return json({
     publishableKey: env.STRIPE_PUBLISHABLE_KEY,
     clientSecret: r.data.client_secret,
