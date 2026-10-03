@@ -1,242 +1,209 @@
-// worker-merged.js — Sage worker: checkout, course price $50, 7-day yearly trial, cash-back webhook
-// Required secrets: STRIPE_SECRET_KEY, STRIPE_PUBLISHABLE_KEY, SIGNING_SECRET, STRIPE_WEBHOOK_SECRET
+// Sage — Cloudflare Worker: Stripe Embedded Checkout + signed unlock tokens.
+// Routes: POST /api/checkout, GET /api/session?id=cs_..., POST /api/verify
+// Everything else is served from /public by the ASSETS binding.
+//
+// Required secrets (already set in Cloudflare -> Variables and Secrets):
+//   STRIPE_SECRET_KEY, STRIPE_PUBLISHABLE_KEY, SIGNING_SECRET
+// Required plain variables (set in wrangler.jsonc "vars"):
+//   PRICE_COURSE, PRICE_MONTHLY, PRICE_YEARLY
+
+const STRIPE_API = 'https://api.stripe.com/v1';
+// Pinned so the request shapes below keep working when Stripe ships newer API versions.
+const STRIPE_VERSION = '2025-03-31.basil';
 
 const PLANS = {
-  course: { mode: "payment", amount: 5000, name: "Sage Course Access (lifetime)", desc: "All 100 lessons, 320 practice questions, unit tests and Course Challenge" },
-  m: { mode: "subscription", amount: 500, interval: "month", trialDays: 14, name: "Sage+ Monthly", desc: "Dashboard, streaks, mastery breakdown, certificate, unlimited arcade and tools" },
-  y: { mode: "subscription", amount: 5000, interval: "year", trialDays: 7, name: "Sage+ Annual", desc: "Dashboard, streaks, mastery breakdown, certificate, unlimited arcade and tools" },
+  course: { mode: 'payment', priceVar: 'PRICE_COURSE' },
+  m: { mode: 'subscription', priceVar: 'PRICE_MONTHLY', trialDays: 14 },
+  y: { mode: 'subscription', priceVar: 'PRICE_YEARLY', trialDays: 7 },
 };
-const CASHBACK_PERCENT = { m: 10, y: 15 };
 
-const json = (data, status = 200) =>
-  new Response(JSON.stringify(data), { status, headers: { "Content-Type": "application/json", "Cache-Control": "no-store" } });
+const enc = new TextEncoder();
+const dec = new TextDecoder();
 
-function encode(obj, prefix = "", out = []) {
-  for (const [k, v] of Object.entries(obj)) {
-    if (v === undefined || v === null) continue;
-    const key = prefix ? `${prefix}[${k}]` : k;
-    if (typeof v === "object") encode(v, key, out);
-    else out.push(`${encodeURIComponent(key)}=${encodeURIComponent(String(v))}`);
-  }
-  return out;
+/* ---------- small helpers ---------- */
+
+function json(data, status = 200) {
+  return new Response(JSON.stringify(data), {
+    status,
+    headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' },
+  });
 }
 
-async function stripe(env, method, path, params, extraHeaders = {}) {
-  if (!env.STRIPE_SECRET_KEY) throw new Error("STRIPE_SECRET_KEY is not set");
-  const headers = { Authorization: `Bearer ${env.STRIPE_SECRET_KEY}`, "Stripe-Version": "2025-02-24.acacia", ...extraHeaders };
-  let url = "https://api.stripe.com/v1" + path;
-  const init = { method, headers };
-  if (params) {
-    const body = encode(params).join("&");
-    if (method === "GET") url += "?" + body;
-    else {
-      init.body = body;
-      headers["Content-Type"] = "application/x-www-form-urlencoded";
-    }
-  }
-  const res = await fetch(url, init);
-  const data = await res.json();
-  if (!res.ok) throw new Error((data.error && data.error.message) || "Stripe error");
-  return data;
+function b64url(bytes) {
+  let s = '';
+  for (const b of bytes) s += String.fromCharCode(b);
+  return btoa(s).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
 }
 
-const b64u = (buf) => btoa(String.fromCharCode(...new Uint8Array(buf))).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
-const fromB64u = (s) => Uint8Array.from(atob(s.replace(/-/g, "+").replace(/_/g, "/")), (c) => c.charCodeAt(0));
+function unb64url(str) {
+  const s = str.replace(/-/g, '+').replace(/_/g, '/');
+  const bin = atob(s + '='.repeat((4 - (s.length % 4)) % 4));
+  return Uint8Array.from(bin, (c) => c.charCodeAt(0));
+}
 
-async function hmacKey(env) {
-  if (!env.SIGNING_SECRET) throw new Error("SIGNING_SECRET is not set");
-  return crypto.subtle.importKey("raw", new TextEncoder().encode(env.SIGNING_SECRET), { name: "HMAC", hash: "SHA-256" }, false, ["sign", "verify"]);
+function hmacKey(env, usages) {
+  return crypto.subtle.importKey('raw', enc.encode(env.SIGNING_SECRET), { name: 'HMAC', hash: 'SHA-256' }, false, usages);
 }
-async function sign(env, payload) {
-  const body = b64u(new TextEncoder().encode(JSON.stringify(payload)));
-  const sig = await crypto.subtle.sign("HMAC", await hmacKey(env), new TextEncoder().encode(body));
-  return body + "." + b64u(sig);
+
+async function signToken(payload, env) {
+  const body = b64url(enc.encode(JSON.stringify(payload)));
+  const key = await hmacKey(env, ['sign']);
+  const sig = new Uint8Array(await crypto.subtle.sign('HMAC', key, enc.encode(body)));
+  return body + '.' + b64url(sig);
 }
-async function verify(env, token) {
-  if (typeof token !== "string") return null;
-  const [body, sig] = token.split(".");
-  if (!body || !sig) return null;
+
+// Returns the payload if the signature is valid, otherwise null.
+async function readToken(token, env) {
+  if (typeof token !== 'string' || token.length > 2000) return null;
+  const parts = token.split('.');
+  if (parts.length !== 2) return null;
   try {
-    const ok = await crypto.subtle.verify("HMAC", await hmacKey(env), fromB64u(sig), new TextEncoder().encode(body));
+    const key = await hmacKey(env, ['verify']);
+    const ok = await crypto.subtle.verify('HMAC', key, unb64url(parts[1]), enc.encode(parts[0]));
     if (!ok) return null;
-    return JSON.parse(new TextDecoder().decode(fromB64u(body)));
-  } catch {
+    const payload = JSON.parse(dec.decode(unb64url(parts[0])));
+    return payload && payload.v === 1 ? payload : null;
+  } catch (e) {
     return null;
   }
 }
 
-// ---- /api/checkout ----
+async function stripeFetch(env, method, path, params) {
+  const init = {
+    method,
+    headers: {
+      Authorization: 'Bearer ' + env.STRIPE_SECRET_KEY,
+      'Stripe-Version': STRIPE_VERSION,
+    },
+  };
+  if (params && method !== 'GET') {
+    init.headers['Content-Type'] = 'application/x-www-form-urlencoded';
+    init.body = params.toString();
+  }
+  const res = await fetch(STRIPE_API + path, init);
+  let data = null;
+  try {
+    data = await res.json();
+  } catch (e) {}
+  return { ok: res.ok, status: res.status, data };
+}
+
+function getSession(env, id) {
+  const q = 'expand%5B%5D=subscription&expand%5B%5D=payment_intent.latest_charge';
+  return stripeFetch(env, 'GET', '/checkout/sessions/' + encodeURIComponent(id) + '?' + q);
+}
+
+// Is this Checkout Session still entitled to its plan right now?
+function entitled(s) {
+  const plan = s.metadata && s.metadata.plan;
+  if (!PLANS[plan] || s.status !== 'complete') return null;
+  if (plan === 'course') {
+    const charge = s.payment_intent && typeof s.payment_intent === 'object' ? s.payment_intent.latest_charge : null;
+    const refunded = charge && typeof charge === 'object' && charge.refunded === true;
+    return s.payment_status === 'paid' && !refunded ? { plan } : null;
+  }
+  // Sage+ (trial counts): subscription must exist and be trialing or active.
+  const sub = s.subscription && typeof s.subscription === 'object' ? s.subscription : null;
+  return sub && (sub.status === 'trialing' || sub.status === 'active') ? { plan, sub: sub.id } : null;
+}
+
+/* ---------- routes ---------- */
+
 async function checkout(request, env) {
+  let body;
   try {
-    const body = await request.json().catch(() => ({}));
-    const plan = body.plan;
-    const p = PLANS[plan];
-    if (!p) return json({ error: "Unknown plan" }, 400);
-    if (!env.STRIPE_PUBLISHABLE_KEY) throw new Error("STRIPE_PUBLISHABLE_KEY is not set");
-    const origin = new URL(request.url).origin;
-    const price_data = { currency: "usd", unit_amount: p.amount, product_data: { name: p.name, description: p.desc } };
-    if (p.interval) price_data.recurring = { interval: p.interval };
-    const params = {
-      ui_mode: "embedded",
-      mode: p.mode,
-      line_items: [{ quantity: 1, price_data }],
-      allow_promotion_codes: true,
-      metadata: { plan },
-      redirect_on_completion: "if_required",
-      return_url: `${origin}/?session_id={CHECKOUT_SESSION_ID}`,
-    };
-    if (p.mode === "subscription") {
-      params.payment_method_collection = "always"; // card up front so the trial can convert
-      params.subscription_data = { metadata: { plan }, trial_period_days: p.trialDays };
-    }
-    const session = await stripe(env, "POST", "/checkout/sessions", params);
-    return json({ clientSecret: session.client_secret, sessionId: session.id, publishableKey: env.STRIPE_PUBLISHABLE_KEY });
+    body = await request.json();
   } catch (e) {
-    console.error(e);
-    return json({ error: "Checkout is unavailable right now. Please try again." }, 500);
+    return json({ error: 'Bad request.' }, 400);
   }
+  const planKey = body && body.plan;
+  const plan = PLANS[planKey];
+  if (!plan) return json({ error: 'Unknown plan.' }, 400);
+
+  const priceId = env[plan.priceVar];
+  if (!env.STRIPE_SECRET_KEY || !env.STRIPE_PUBLISHABLE_KEY || !env.SIGNING_SECRET || !priceId) {
+    return json({ error: 'Payments are not configured yet.' }, 500);
+  }
+
+  const origin = new URL(request.url).origin;
+  const p = new URLSearchParams();
+  p.set('ui_mode', 'embedded');
+  p.set('mode', plan.mode);
+  p.set('line_items[0][price]', priceId);
+  p.set('line_items[0][quantity]', '1');
+  p.set('return_url', origin + '/?session_id={CHECKOUT_SESSION_ID}&paid=' + planKey);
+  p.set('redirect_on_completion', 'if_required');
+  p.set('metadata[plan]', planKey);
+  if (plan.mode === 'subscription') {
+    p.set('subscription_data[trial_period_days]', String(plan.trialDays));
+    p.set('subscription_data[metadata][plan]', planKey);
+  }
+
+  const r = await stripeFetch(env, 'POST', '/checkout/sessions', p);
+  if (!r.ok || !r.data || !r.data.client_secret) {
+    return json({ error: 'Could not start checkout. Please try again.' }, 502);
+  }
+  return json({
+    publishableKey: env.STRIPE_PUBLISHABLE_KEY,
+    clientSecret: r.data.client_secret,
+    sessionId: r.data.id,
+  });
 }
 
-// ---- /api/session ----
-async function session(request, env) {
-  try {
-    const id = String(new URL(request.url).searchParams.get("id") || "");
-    if (!/^cs_/.test(id)) return json({ error: "Bad session id" }, 400);
-    const s = await stripe(env, "GET", "/checkout/sessions/" + encodeURIComponent(id));
-    const plan = s.metadata && s.metadata.plan;
-    if (!PLANS[plan]) return json({ error: "Unknown plan" }, 400);
-    const paidOk = s.payment_status === "paid" || (s.mode === "subscription" && s.payment_status === "no_payment_required");
-    if (s.status !== "complete" || !paidOk) return json({ error: "Payment not completed yet" }, 402);
-    const sub = typeof s.subscription === "string" ? s.subscription : (s.subscription && s.subscription.id) || null;
-    return json({ plan, token: await sign(env, { plan, sub, iat: Date.now() }) });
-  } catch (e) {
-    console.error(e);
-    return json({ error: "Could not confirm payment." }, 500);
-  }
+async function session(url, env) {
+  const id = url.searchParams.get('id') || '';
+  if (!/^cs_(test|live)_[A-Za-z0-9]+$/.test(id)) return json({ error: 'Invalid session.' }, 400);
+  if (!env.STRIPE_SECRET_KEY || !env.SIGNING_SECRET) return json({ error: 'Payments are not configured yet.' }, 500);
+
+  const r = await getSession(env, id);
+  if (r.status === 404) return json({ error: 'Payment not found.' }, 404);
+  if (!r.ok || !r.data) return json({ error: 'Could not confirm payment. Please try again.' }, 502);
+
+  const ent = entitled(r.data);
+  if (!ent) return json({ error: 'Payment not completed yet.' }, 402);
+
+  const token = await signToken({ v: 1, plan: ent.plan, sid: r.data.id, iat: Date.now() }, env);
+  return json({ token, plan: ent.plan });
 }
 
-// ---- /api/verify ----
-async function verifyToken(request, env) {
+async function verify(request, env) {
+  let body;
   try {
-    const body = await request.json().catch(() => ({}));
-    const t = await verify(env, body.token);
-    if (!t) return json({ ok: false });
-    if (t.plan === "course") return json({ ok: true, plan: "course" });
-    if ((t.plan === "m" || t.plan === "y") && t.sub) {
-      const sub = await stripe(env, "GET", "/subscriptions/" + encodeURIComponent(t.sub));
-      return json({ ok: sub.status === "active" || sub.status === "trialing", plan: t.plan });
-    }
+    body = await request.json();
+  } catch (e) {
     return json({ ok: false });
-  } catch (e) {
-    console.error(e);
-    return json({ error: "Verification failed" }, 500);
   }
+  if (!env.STRIPE_SECRET_KEY || !env.SIGNING_SECRET) return json({ error: 'Not configured.' }, 500);
+
+  const payload = await readToken(body && body.token, env);
+  if (!payload || !PLANS[payload.plan] || typeof payload.sid !== 'string') return json({ ok: false });
+
+  const r = await getSession(env, payload.sid);
+  // Stripe does not know this session (for example a test-mode token after going live).
+  if (r.status === 404) return json({ ok: false });
+  // Temporary trouble: answer with an error so the page keeps the user's access.
+  if (!r.ok || !r.data) return json({ error: 'Could not verify right now.' }, 503);
+
+  const ent = entitled(r.data);
+  if (!ent || ent.plan !== payload.plan) return json({ ok: false });
+  return json({ ok: true, plan: ent.plan });
 }
 
-// ---- /api/webhook (cash-back) ----
-const enc = new TextEncoder();
-function timingSafeEqual(a, b) {
-  if (a.length !== b.length) return false;
-  let diff = 0;
-  for (let i = 0; i < a.length; i++) diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
-  return diff === 0;
-}
-async function verifyStripeSignature(rawBody, header, secret, toleranceSec = 300) {
-  if (!header || !secret) return false;
-  let t = null;
-  const sigs = [];
-  for (const part of header.split(",")) {
-    const [k, v] = part.split("=");
-    if (k === "t") t = v;
-    else if (k === "v1") sigs.push(v);
-  }
-  if (!t || sigs.length === 0) return false;
-  if (Math.abs(Date.now() / 1000 - Number(t)) > toleranceSec) return false;
-  const key = await crypto.subtle.importKey("raw", enc.encode(secret), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
-  const mac = new Uint8Array(await crypto.subtle.sign("HMAC", key, enc.encode(`${t}.${rawBody}`)));
-  const expected = [...mac].map((b) => b.toString(16).padStart(2, "0")).join("");
-  return sigs.some((s) => timingSafeEqual(s, expected));
-}
-
-async function webhook(request, env) {
-  const raw = await request.text();
-  if (!(await verifyStripeSignature(raw, request.headers.get("stripe-signature"), env.STRIPE_WEBHOOK_SECRET))) {
-    return json({ error: "Invalid signature" }, 400);
-  }
-  const event = JSON.parse(raw);
-  try {
-    if (event.type === "customer.subscription.deleted") await onSubscriptionEnded(event.data.object, env);
-    return json({ received: true });
-  } catch (e) {
-    console.error("webhook failed", event.id, e);
-    return json({ error: "Handler error" }, 500); // Stripe retries
-  }
-}
-
-async function onSubscriptionEnded(sub, env) {
-  const skip = (why) => console.log(`[cashback] ${sub.id}: skipped (${why})`);
-
-  // Voluntary cancellations only
-  const reason = sub.cancellation_details && sub.cancellation_details.reason;
-  if (reason !== "cancellation_requested") return skip(`reason=${reason}`);
-
-  // Cancelled during the trial => never billed
-  const endedAt = sub.ended_at || Math.floor(Date.now() / 1000);
-  if (sub.trial_end && endedAt <= sub.trial_end) return skip("cancelled during trial");
-
-  const plan = sub.metadata && sub.metadata.plan;
-  const percent = CASHBACK_PERCENT[plan];
-  if (!percent) return skip(`no cash-back for plan=${plan}`);
-
-  // Must have actually paid something
-  const invoices = await stripe(env, "GET", "/invoices", { subscription: sub.id, status: "paid", limit: 100 });
-  const paid = invoices.data.filter((i) => i.amount_paid > 0);
-  if (paid.length === 0) return skip("no paid invoices");
-
-  const totalPaid = paid.reduce((sum, i) => sum + i.amount_paid, 0);
-  const cashback = Math.round((totalPaid * percent) / 100);
-
-  const latest = paid.sort((a, b) => b.created - a.created)[0];
-  if (!latest.charge) throw new Error(`Invoice ${latest.id} has no charge`);
-  const charge = await stripe(env, "GET", "/charges/" + encodeURIComponent(latest.charge));
-
-  // Stateless de-dupe against Stripe itself
-  const existing = await stripe(env, "GET", "/refunds", { charge: charge.id, limit: 100 });
-  if (existing.data.some((r) => r.metadata && r.metadata.cashback_for === sub.id)) return skip("already refunded");
-
-  const amount = Math.min(cashback, charge.amount - charge.amount_refunded);
-  if (amount <= 0) return skip("nothing refundable");
-
-  const refund = await stripe(
-    env, "POST", "/refunds",
-    { charge: charge.id, amount, reason: "requested_by_customer", metadata: { cashback_for: sub.id, percent: String(percent), plan } },
-    { "Idempotency-Key": `cashback-${sub.id}` }
-  );
-  console.log(`[cashback] ${sub.id}: refunded ${amount} cents (${percent}%) -> ${refund.id}`);
-}
+/* ---------- entry ---------- */
 
 export default {
   async fetch(request, env) {
-    const { pathname } = new URL(request.url);
-    const m = request.method;
-    if (pathname === "/api/checkout" && m === "POST") return checkout(request, env);
-    if (pathname === "/api/session" && m === "GET") return session(request, env);
-    if (pathname === "/api/verify" && m === "POST") return verifyToken(request, env);
-    if (pathname === "/api/webhook" && m === "POST") return webhook(request, env);
-    if (pathname.startsWith("/api/")) return json({ error: "Not found" }, 404);
-
-    const res = await env.ASSETS.fetch(request);
-    const type = res.headers.get("content-type") || "";
-    if (!type.includes("text/html")) return res;
-    // Fix displayed price/trial text without touching the page files
-    let html = await res.text();
-    html = html
-      .replaceAll("$59", () => "$50")
-      .replace("Sage+ starts with a 2-week free trial,", () => "Sage+ starts with a free trial (2 weeks monthly, 1 week annual),");
-    const headers = new Headers(res.headers);
-    headers.delete("content-length");
-    headers.delete("content-encoding");
-    headers.delete("etag");
-    return new Response(html, { status: res.status, headers });
+    const url = new URL(request.url);
+    if (url.pathname.startsWith('/api/')) {
+      try {
+        if (url.pathname === '/api/checkout' && request.method === 'POST') return await checkout(request, env);
+        if (url.pathname === '/api/session' && request.method === 'GET') return await session(url, env);
+        if (url.pathname === '/api/verify' && request.method === 'POST') return await verify(request, env);
+        return json({ error: 'Not found.' }, 404);
+      } catch (e) {
+        return json({ error: 'Something went wrong. Please try again.' }, 500);
+      }
+    }
+    return env.ASSETS.fetch(request);
   },
 };
